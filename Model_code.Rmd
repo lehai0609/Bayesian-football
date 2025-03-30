@@ -1,0 +1,434 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r}
+library(truncnorm)
+library(magic)
+library(dplyr)
+library(future)
+library(future.apply)
+library(coda)
+library(ggplot2)
+library(ggpubr)
+library(mlr3measures)
+library(tidyr)
+
+load("test_outcome.Rdata") 
+load("test_designmat.Rdata")
+load("d4_unique.Rdata")
+```
+
+#Import data
+
+```{r}
+s14 = read.csv("Finaldata4c_complete.csv")
+
+Dmat1 = s14[,-1] #Input matrix
+Dmat = Dmat1[complete.cases(Dmat1),]
+rownames(Dmat) = seq(length=nrow(Dmat))  
+
+Dmat$intercept = 1 #Adding intercept
+Dmat = cbind(Dmat[,!(names(Dmat) %in% c("Outcome"))],Dmat[,(names(Dmat) %in% c("Outcome"))])
+colnames(Dmat)[1624] <- "Outcome"
+
+Dmat = Dmat[,-c(1441:1620)] #Remove 180 throwin variables
+
+set.seed(83)
+rownum =sample(1:nrow(Dmat),nrow(Dmat)/10,replace = FALSE)
+test = Dmat[rownum,]
+train = Dmat[-rownum,]
+
+N = nrow(Dmat) #Total obs
+P = ncol(Dmat) - 1 #No. of covariates
+Z = train[,P+1] + 2 # +2 done for L1 & L2 calc ease (Changing outcome from -1,0,1 to 1,2,3)
+J = length(unique(Z)) #No of outcome categories
+truez = test[,(P+1)] #True values in test dataset (Still contains -1,0,1 as outcome)(Will need to change to 1,2,3 for comparison)
+
+X_char11 = train[,-c(P+1)]
+
+ar1_cor <- function(n, rho) {
+exponent <- abs(matrix(1:n - 1, nrow = n, ncol = n, byrow = TRUE) - 
+    (1:n - 1))
+exp(rho*exponent)
+}
+
+mean_delta = 0 
+betasd = 10
+```
+
+#Model function
+
+```{r}
+mcmc_1 = function(k,c,y_sd,stdnorm){
+
+X_char1 = X_char11[,c(1:k,91:(k+90),181:(180+k),271:(270+k),361:(360+k),451:(450+k),541:(540+k),631:(630+k),721:(720+k),811:(810+k),901:(900+k),991:(990+k),1081:(1080+k),1171:(1170+k),1261:(1260+k),1351:(1350+k),1441,1442,1443)] 
+  
+d01 = colnames(X_char1[, colSums(X_char1 != 0) > 0])
+d02 = setdiff(colnames(X_char1),d01)
+d03 = colnames(Dmat[, colSums(Dmat != 0) > 0])
+d04 = setdiff(colnames(Dmat),d03)
+common = intersect(d02,d04)  
+d4_unique = common
+
+X_char = X_char1 %>% dplyr::select(-d4_unique) 
+  
+d_home = grep("Home",d4_unique,value = TRUE) 
+d_away = setdiff(d4_unique,d_home)
+  
+X_char = as.matrix(X_char)
+X1 = matrix(as.numeric(X_char),ncol = ncol(X_char))
+X1 = data.frame(X1)
+colnames(X1) <- colnames(X_char)
+X1 = as.matrix(X1)
+X11 = scale(X1)
+all_zeros = colnames(X11)[apply(X11, 2, anyNA)]
+X11[,c(all_zeros)] <- X1[,c(all_zeros)]
+X = X11
+N1 = nrow(X)
+P1 = ncol(X_char)
+  
+#-------------------------------------------------------------
+#-------------------------------------------------------------
+  
+#Prior for Betas
+c = c #Put sd here not variance
+c1 = 1
+M1a = c1*ar1_cor(k - length(d_home),-0.3567)
+M1h = c1*ar1_cor(k - length(d_away),-0.3567)
+M2 = c1*ar1_cor(k,-0.3567)
+M22 = kronecker(diag(1,14), M2)
+M3 = matrix(c(c1,0,0,0,c1,0,0,0,c1),ncol = 3)
+sigma_not = adiag(M1h,M1a,M22,M3)
+  
+beta_not = c(rep(0,k - length(d_home)),rep(0,k - length(d_away)), #Red cards
+               rep(0,k),rep(0,k),                                   #Yellow cards
+               rep(0,k),rep(0,k),                                   #Corner
+               rep(0,k),rep(0,k),                                   #Cross
+               rep(0,k),rep(0,k),                                     #Foul
+               rep(0,k),rep(0,k),                                  #Goal
+               rep(0,k),rep(0,k),                                      #Shotoff
+               rep(0,k),rep(0,k),                                   #Shoton
+               0,0,0)                                                 #H/A strength,intercept
+  
+beta_not = as.matrix(beta_not)
+Inv_sigma_not = solve(sigma_not)
+  
+#-------------------------------------------------------------
+
+alphavec = rep(1,J) #Posterior sampling from Beta(1,1)
+
+#-------------------------------------------------------------
+#-------------------------------------------------------------
+
+Beta = c(rnorm(k-length(d_home),mean=-40,sd=betasd),rnorm(k-length(d_away),mean=40,sd=betasd), #Red
+           rnorm(k,mean=-10,sd=betasd),rnorm(k,mean=10,sd=betasd),     #Yellow
+           rnorm(k,mean=20,sd=betasd),rnorm(k,mean=-20,sd=betasd),     #Corner
+           rnorm(k,mean=-10,sd=betasd),rnorm(k,mean=10,sd=betasd),     #Cross
+           rnorm(k,mean=-4,sd=betasd),rnorm(k,mean=4,sd=betasd),       #Foul
+           rnorm(k,mean=100,sd=betasd),rnorm(k,mean=-80,sd=betasd),    #Goal
+           rnorm(k,mean=0,sd=betasd),rnorm(k,mean=0,sd=betasd),        #Shotoff
+           rnorm(k,mean=10,sd=betasd),rnorm(k,mean=-10,sd=betasd),     #Shoton
+           rnorm(1,mean=5,sd=betasd),rnorm(1,mean=-3,sd=betasd),       #H/A Strength,Intercept
+           rnorm(1,mean=0,sd=betasd)) #Initial values for beta coefficients for computing Ymean
+n_param = length(Beta)
+  
+deltavec = c((-0.43*stdnorm),(0.43*stdnorm))
+deltavec = sort(deltavec)
+deltavec = c(-Inf,deltavec,Inf) 
+ 
+#-------------------------------------------------------------
+#-------------------------------------------------------------  
+   
+#Posterior Sampling
+
+deltamat = vector(mode="numeric",length=0)
+
+betamat = matrix(data=NA,nrow=length(Beta),ncol=11000)
+
+
+niter = 11000 #No of iterations of Gibbs sampling
+
+post_var = solve( (y_sd^(-2))*t(X)%*%X + (c^(-2))*Inv_sigma_not )
+post_var_chol = chol(post_var)
+  
+for(i in 1:niter)
+{
+L1 = deltavec[Z] 
+L2 = deltavec[Z+1] 
+ymean = X%*%Beta 
+y = rtruncnorm(N1,a = L1, b = L2, mean = ymean, sd = y_sd) 
+y = as.matrix(y)
+
+post_mean = as.numeric((y_sd^(-2))*post_var%*%(t(X)%*%y + Inv_sigma_not %*% beta_not))
+Beta = colSums(t(post_var_chol)*rnorm(n_param)) + post_mean 
+Beta = matrix(Beta,nrow = n_param,ncol = 1)
+
+betamat[,i] = Beta
+  
+for(j in 1:(J-1)) 
+{
+ycat1 = y[Z==j];c1 = max(ycat1)
+ycat2 = y[Z==j+1];c2 = min(ycat2)
+a1 = pnorm(deltavec[j],mean=0,stdnorm) #Between 0 and 1
+b1 = pnorm(deltavec[j+2],mean=0,stdnorm) #Between 0 and 1
+w1 = (pnorm(c1,0,stdnorm)-a1)/(b1-a1) #w1 is less than 1
+w2 = (pnorm(c2,0,stdnorm)-a1)/(b1-a1) #w2 is greater w1
+w = ifelse(w2>w1,runif(1,min = w1,max = w2),ifelse(w2 == w1, w1, runif(1,min = w2,max = w1)))
+prob_inv = ((b1-a1)*w)+a1
+deltavec[j+1] = qnorm(prob_inv,mean=mean_delta,stdnorm)
+} #Delta loop close   
+  
+deltamat = cbind(deltamat,deltavec[2:3])
+
+} #Iteration loop close
+
+outputt = list(deltamat,betamat,rownum,d4_unique)
+}
+```
+
+```{r}
+mcmc_2 = function(k,c,y_sd,stdnorm){
+
+X_char1 = X_char11[,c(1:k,91:(k+90),181:(180+k),271:(270+k),361:(360+k),451:(450+k),541:(540+k),631:(630+k),721:(720+k),811:(810+k),901:(900+k),991:(990+k),1081:(1080+k),1171:(1170+k),1261:(1260+k),1351:(1350+k),1441,1442,1443)] 
+  
+d01 = colnames(X_char1[, colSums(X_char1 != 0) > 0])
+d02 = setdiff(colnames(X_char1),d01)
+d03 = colnames(Dmat[, colSums(Dmat != 0) > 0])
+d04 = setdiff(colnames(Dmat),d03)
+common = intersect(d02,d04)  
+d4_unique = common
+
+X_char = X_char1 %>% dplyr::select(-d4_unique) 
+  
+d_home = grep("Home",d4_unique,value = TRUE) 
+d_away = setdiff(d4_unique,d_home)
+  
+X_char = as.matrix(X_char)
+X1 = matrix(as.numeric(X_char),ncol = ncol(X_char))
+X1 = data.frame(X1)
+colnames(X1) <- colnames(X_char)
+X1 = as.matrix(X1)
+X11 = scale(X1)
+all_zeros = colnames(X11)[apply(X11, 2, anyNA)]
+X11[,c(all_zeros)] <- X1[,c(all_zeros)]
+X = X11
+N1 = nrow(X)
+P1 = ncol(X_char)
+  
+#-------------------------------------------------------------
+#-------------------------------------------------------------
+  
+#Prior for Betas
+c = c #Put sd here not variance
+c1 = 1
+M1a = c1*ar1_cor(k - length(d_home),-0.3567)
+M1h = c1*ar1_cor(k - length(d_away),-0.3567)
+M2 = c1*ar1_cor(k,-0.3567)
+M22 = kronecker(diag(1,14), M2)
+M3 = matrix(c(c1,0,0,0,c1,0,0,0,c1),ncol = 3)
+sigma_not = adiag(M1h,M1a,M22,M3)
+  
+beta_not = c(rep(0,k - length(d_home)),rep(0,k - length(d_away)), #Red cards
+               rep(0,k),rep(0,k),                                   #Yellow cards
+               rep(0,k),rep(0,k),                                   #Corner
+               rep(0,k),rep(0,k),                                   #Cross
+               rep(0,k),rep(0,k),                                     #Foul
+               rep(0,k),rep(0,k),                                  #Goal
+               rep(0,k),rep(0,k),                                      #Shotoff
+               rep(0,k),rep(0,k),                                   #Shoton
+               0,0,0)                                                 #H/A strength,intercept
+  
+beta_not = as.matrix(beta_not)
+Inv_sigma_not = solve(sigma_not)
+  
+#-------------------------------------------------------------
+
+alphavec = rep(1,J) #Posterior sampling from Beta(1,1)
+
+#-------------------------------------------------------------
+#-------------------------------------------------------------
+
+Beta = c(rnorm(k-length(d_home),mean=-40,sd=betasd),rnorm(k-length(d_away),mean=40,sd=betasd), #Red
+           rnorm(k,mean=-10,sd=betasd),rnorm(k,mean=10,sd=betasd),     #Yellow
+           rnorm(k,mean=20,sd=betasd),rnorm(k,mean=-20,sd=betasd),     #Corner
+           rnorm(k,mean=-10,sd=betasd),rnorm(k,mean=10,sd=betasd),     #Cross
+           rnorm(k,mean=-4,sd=betasd),rnorm(k,mean=4,sd=betasd),       #Foul
+           rnorm(k,mean=100,sd=betasd),rnorm(k,mean=-80,sd=betasd),    #Goal
+           rnorm(k,mean=0,sd=betasd),rnorm(k,mean=0,sd=betasd),        #Shotoff
+           rnorm(k,mean=10,sd=betasd),rnorm(k,mean=-10,sd=betasd),     #Shoton
+           rnorm(1,mean=5,sd=betasd),rnorm(1,mean=-3,sd=betasd),       #H/A Strength,Intercept
+           rnorm(1,mean=0,sd=betasd)) #Initial values for beta coefficients for computing Ymean
+n_param = length(Beta)
+  
+deltavec = c((-0.43*stdnorm),(0.43*stdnorm))
+deltavec = sort(deltavec)
+deltavec = c(-Inf,deltavec,Inf) 
+ 
+#-------------------------------------------------------------
+#-------------------------------------------------------------  
+   
+#Posterior Sampling
+
+deltamat = vector(mode="numeric",length=0)
+delta_diag1 = vector(mode="numeric",length=0)
+delta_diag2 = vector(mode="numeric",length=0)
+
+betamat = matrix(data=NA,nrow=length(Beta),ncol=300000)
+
+
+niter = 300000 #No of iterations of Gibbs sampling
+
+post_var = solve( (y_sd^(-2))*t(X)%*%X + (c^(-2))*Inv_sigma_not )
+post_var_chol = chol(post_var)
+  
+for(i in 1:niter)
+{
+L1 = deltavec[Z] 
+L2 = deltavec[Z+1] 
+ymean = X%*%Beta 
+y = rtruncnorm(N1,a = L1, b = L2, mean = ymean, sd = y_sd) 
+y = as.matrix(y)
+
+post_mean = as.numeric((y_sd^(-2))*post_var%*%(t(X)%*%y + Inv_sigma_not %*% beta_not))
+Beta = colSums(t(post_var_chol)*rnorm(n_param)) + post_mean 
+Beta = matrix(Beta,nrow = n_param,ncol = 1)
+
+betamat[,i] = Beta
+  
+for(j in 1:(J-1)) 
+{
+ycat1 = y[Z==j];c1 = max(ycat1)
+ycat2 = y[Z==j+1];c2 = min(ycat2)
+a1 = pnorm(deltavec[j],mean=0,stdnorm) #Between 0 and 1
+b1 = pnorm(deltavec[j+2],mean=0,stdnorm) #Between 0 and 1
+w1 = (pnorm(c1,0,stdnorm)-a1)/(b1-a1) #w1 is less than 1
+w2 = (pnorm(c2,0,stdnorm)-a1)/(b1-a1) #w2 is greater w1
+w = ifelse(w2>w1,runif(1,min = w1,max = w2),ifelse(w2 == w1, w1, runif(1,min = w2,max = w1)))
+prob_inv = ((b1-a1)*w)+a1
+deltavec[j+1] = qnorm(prob_inv,mean=mean_delta,stdnorm)
+} #Delta loop close   
+  
+deltamat = cbind(deltamat,deltavec[2:3])
+
+delta_diag1 = ifelse(i > 10000 & i%%1000 == 0,geweke.diag(deltamat[1,],frac1 = 0.9,frac2 = 0.1)$z,NA)
+delta_diag2 = ifelse(i > 10000 & i%%1000 == 0,geweke.diag(deltamat[2,],frac1 = 0.9,frac2 = 0.1)$z,NA)
+
+if(i > 10000 & i%%1000 == 0 & abs(delta_diag2) < 1.96 & abs(delta_diag1) < 1.96){
+  break
+}
+
+} #Iteration loop close
+
+outputt = list(deltamat,betamat,rownum,d4_unique)
+}
+```
+
+# Sequential code
+
+```{r message=FALSE, warning=FALSE}
+start.time = Sys.time()
+
+plan(multisession,workers = 15) 
+Models <- c(1:25)
+data <- future_lapply(Models, future.scheduling = 1.0,future.seed = TRUE, function(k) {
+set.seed(83)  
+mcmc_2(k,c=0.5,y_sd = 14,stdnorm = 200) 
+})
+
+end.time = Sys.time()
+time = start.time - end.time
+time
+
+saveRDS(data, sprintf("model_result_A.rds"))
+```
+
+```{r message=FALSE, warning=FALSE}
+start.time = Sys.time()
+
+plan(multisession,workers = 15) 
+Models <- c(26:90)
+data1 <- future_lapply(Models, future.scheduling = 1.0,future.seed = TRUE, function(k) {
+set.seed(83)  
+mcmc_1(k,c=0.5,y_sd = 14,stdnorm = 200) 
+})
+
+end.time = Sys.time()
+time = start.time - end.time
+time
+
+saveRDS(data1, sprintf("model_result_B.rds"))
+```
+
+```{r}
+#merge data and data1 after cleaning data betamat and deltamat
+library(dplyr)
+for(i in 1:25){
+  len = length(data[[i]][[1]][1,])
+  data[[i]][[2]] = subset(data[[i]][[2]], select = c(1:len))
+}
+
+data2 = c(data,data1)
+
+saveRDS(data2, sprintf("model_result.rds"))
+```
+
+
+```{r message=FALSE, warning=FALSE}
+y_sd = 14
+models=90
+
+yprobvec_d = array()
+yprobvec_l = array()
+yprobvec_w = array()  
+
+outcome = list()
+
+for(k in 1:models){
+  
+a = data[[k]][[2]]
+a2 = ncol(a)
+a3 = t(a[,c(seq(1,a2,10))])
+a4 = tail(a3,100)
+beta_mean = colMeans(a4) 
+
+a = data[[k]][[1]]
+a2 = ncol(a)
+a3 = t(a[,c(seq(1,a2,10))])
+a4 = tail(a3,100)
+delta_mean = colMeans(a4) 
+
+xnew1 = test_designmat
+xnew1 = xnew1[,c(1:k,91:(k+90),181:(180+k),271:(270+k),361:(360+k),451:(450+k),541:(540+k),631:(630+k),721:(720+k),811:(810+k),901:(900+k),991:(990+k),1081:(1080+k),1171:(1170+k),1261:(1260+k),1351:(1350+k),1441,1442,1443)] 
+xnew1 = xnew1 %>% dplyr::select(-d4_unique[[k]])
+xnew1 = as.matrix(xnew1)
+xnew = scale(xnew1)
+all_zeros1 = colnames(xnew)[apply(xnew, 2, anyNA)]
+xnew[,c(all_zeros1)] <- xnew1[,c(all_zeros1)]
+
+Y_pred = xnew %*% beta_mean 
+Y_pred_cat_low = ifelse(Y_pred <= delta_mean[1],-1,ifelse(delta_mean[1] < Y_pred & Y_pred <= delta_mean[2],0,1)) 
+  
+pred_prob = as.vector(Y_pred_cat_low) 
+
+#Predicted Probability of winning over time
+deltahatvec =c(-Inf,delta_mean[1],delta_mean[2],Inf)
+for(m in 1:length(Y_pred)) {
+  yprob = pnorm(deltahatvec,mean =Y_pred[m],sd=y_sd) 
+  yprob = diff(yprob)
+  yprobvec_w[m] = yprob[3] #Probability of winning at time k for each match m
+  yprobvec_d[m] = yprob[2] #Probability of drawing at time k for each match m
+  yprobvec_l[m] = yprob[1] #Probability of losing at time k for each match m
+}
+
+outcome[[k]] = list(pred_prob,yprobvec_w,yprobvec_d,yprobvec_l,beta_mean,delta_mean,d4_unique[[k]])
+}
+
+data1 = list()
+data1 <- outcome
+remove(outcome)
+
+saveRDS(data1, sprintf("model_metrics.rds"))
+```
+

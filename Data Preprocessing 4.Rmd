@@ -1,0 +1,270 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r warning=FALSE}
+library(reshape2)
+library(dplyr)
+library(tidyverse)
+library(tidyr)
+library(R2OpenBUGS)
+library(coda)
+```
+
+#Outcome variable created from all_incidents dataset (card variable split in two)
+
+```{r}
+data_all_goalcard = read.csv("all_incidents.csv",header = TRUE)
+
+data_all_card = data_all_goalcard%>% filter((type == "goal" & (subtype1 =="n"|subtype1 =="o"|subtype1 =="p"))| type != "goal") #Remove all goal subtype1's except o,n,p
+data_all = data_all_card%>% filter((type == "card" & !is.na(subtype1))|type != "card") #Remove all NA card subtype1's
+data = data_all
+data$type = ifelse(data$type == "card" & data$subtype1 == "y","card_y",data$type) #Separating red and yellow cards
+```
+
+```{r}
+data_y = read.csv("matchdetails.csv",header = TRUE)
+```
+
+```{r}
+data_x = read.csv("player_details.csv",header=TRUE)
+```
+
+#Changing team id for "o" subtype goals(owngoals)
+
+```{r}
+data_chg = merge(data,data_y[,c(1,8,9)],by.x = "game_id",by.y = "id")
+data_chg$team1 = ifelse(data_chg$type == "goal" & data_chg$subtype1 == "o" & data_chg$team == data_chg$home_team_api_id,data_chg$away_team_api_id,ifelse(data_chg$type == "goal" & data_chg$subtype1 == "o" & data_chg$team == data_chg$away_team_api_id,data_chg$home_team_api_id,data_chg$team))
+data_chg1 = data_chg[,-8]
+names(data_chg1)[names(data_chg1) == "team1"] <- "team"
+```
+
+```{r}
+data1_pre = data_chg1[,c(3,14,10,1)] #Removing columns not required
+```
+
+```{r}
+data1 = data1_pre %>% filter(data1_pre$type != "special") #Removing speicals because of all zero columns
+s = split(x = data1, f = data1$type) #Splitting dataset by type of event
+
+#length(unique(s$goal$game_id))
+```
+
+Adding Home/Away status for teams and sorting by game and Home/Away such that home is first for each game & type
+
+```{r}
+data_ha1 = data_y[,c(1,8)]
+data_ha1$indicator_ha = 1
+colnames(data_ha1) = c("game_id","team","Indicator_HA")
+data_ha2 = data_y[,c(1,9)] 
+data_ha2$indicator_ha = 2
+colnames(data_ha2) = c("game_id","team","Indicator_HA")
+data_ha3 = rbind(data_ha1,data_ha2)
+data_ha4 = data_ha3[order(data_ha3$game_id,data_ha3$Indicator_HA),]
+
+data1ab = merge(data1,data_ha4)
+data1ab = data1ab[order(data1ab$type,data1ab$game_id,data1ab$Indicator_HA),]
+data1a = data1ab #Removing indicator after ordering
+```
+
+```{r}
+u_type = unique(data1a$type)
+s8 = list()
+
+for (j in 1:length(u_type)) {
+
+u_game = unique(data1a$game_id)
+s7 = list()
+
+for (i in 1:length(u_game)) {
+#------------------------------------------------------#
+s1 = subset(data1a,data1a$game_id == u_game[i] & data1a$type == u_type[j])
+u_team = unique(s1$team)
+
+if(length(u_team) == 2) {
+
+s1_a = subset(s1,s1$team == u_team[1])
+t1_a = table(s1_a$elapsed)
+s1_a = s1_a %>% distinct(team,elapsed, .keep_all = TRUE)
+s1_a$count = as.integer(t1_a)
+
+
+s2_a = data.frame("game_id" = rep(u_game[i],90), "elapsed" = 1:90, "count" = NA)
+s3_a = merge(s2_a,s1_a,by = c("elapsed"),all =T)
+s4_a = s3_a[,(names(s3_a) %in% c("elapsed","game_id.x","game_id.y","count.y"))]
+s5_a = dcast(s4_a,s4_a$game_id.x~s4_a$elapsed,value.var = "count.y")
+colnames(s5_a) <- paste0("Home",colnames(s5_a))
+#-------------------------------------------------------#
+
+s1_b = subset(s1,s1$team == u_team[2])
+t1_b = table(s1_b$elapsed) #Gives counts of event at each time. Corrects for instances where we have same event happen many times in the same minute.
+s1_b = s1_b %>% distinct(team,elapsed, .keep_all = TRUE)
+s1_b$count = as.integer(t1_b)
+
+
+s2_b = data.frame("game_id" = rep(u_game[i],90), "elapsed" = 1:90, "count" = NA)
+s3_b = merge(s2_b,s1_b,by = c("elapsed"),all =T)
+s4_b = s3_b[,(names(s3_b) %in% c("elapsed","game_id.x","game_id.y","count.y"))]
+s5_b = dcast(s4_b,s4_b$game_id.x~s4_b$elapsed,value.var = "count.y")
+colnames(s5_b) <- paste0("Away",colnames(s5_b))
+#------------------------------------------------------#
+s6 = cbind(s5_a,s5_b)
+colnames(s6)[1] <- "game_id"
+s7[[i]] = s6[-92]
+#------------------------------------------------------#
+}
+
+if(length(u_team) == 1 & s1$Indicator_HA[1] == 1) {
+
+s1_a = subset(s1,s1$team == u_team[1])
+t1_a = table(s1_a$elapsed)
+s1_a = s1_a %>% distinct(team,elapsed, .keep_all = TRUE)
+s1_a$count = as.integer(t1_a)
+
+
+s2_a = data.frame("game_id" = rep(u_game[i],90), "elapsed" = 1:90, "count" = NA)
+s3_a = merge(s2_a,s1_a,by = c("elapsed"),all =T)
+s4_a = s3_a[,(names(s3_a) %in% c("elapsed","game_id.x","game_id.y","count.y"))]
+#s4_a = s3_a[c(1,2,5,8)]
+s5_a = dcast(s4_a,s4_a$game_id.x~s4_a$elapsed,value.var = "count.y")
+colnames(s5_a) <- paste0("Home",colnames(s5_a))
+
+s2_b = data.frame("game_id" = rep(u_game[i],90), "elapsed" = 1:90, "count" = NA)
+s5_b = dcast(s2_b,s2_b$game_id~s2_b$elapsed,value.var = "count")
+colnames(s5_b) <- paste0("Away",colnames(s5_b))
+#------------------------------------------------------#
+s6 = cbind(s5_a,s5_b)
+colnames(s6)[1] <- "game_id"
+s7[[i]] = s6[-92]
+#------------------------------------------------------#
+}
+
+if(length(u_team) == 1 & s1$Indicator_HA[1] == 2) {
+
+s1_a = subset(s1,s1$team == u_team[1])
+t1_a = table(s1_a$elapsed)
+s1_a = s1_a %>% distinct(team,elapsed, .keep_all = TRUE)
+s1_a$count = as.integer(t1_a)
+
+
+s2_a = data.frame("game_id" = rep(u_game[i],90), "elapsed" = 1:90, "count" = NA)
+s3_a = merge(s2_a,s1_a,by = c("elapsed"),all =T)
+s4_a = s3_a[,(names(s3_a) %in% c("elapsed","game_id.x","game_id.y","count.y"))]
+s5_a = dcast(s4_a,s4_a$game_id.x~s4_a$elapsed,value.var = "count.y")
+colnames(s5_a) <- paste0("Away",colnames(s5_a))
+
+s2_b = data.frame("game_id" = rep(u_game[i],90), "elapsed" = 1:90, "count" = NA)
+s5_b = dcast(s2_b,s2_b$game_id~s2_b$elapsed,value.var = "count")
+colnames(s5_b) <- paste0("Home",colnames(s5_b))
+#------------------------------------------------------#
+s6 = cbind(s5_b,s5_a)
+colnames(s6)[1] <- "game_id"
+s7[[i]] = s6[-92]
+#------------------------------------------------------#
+                                                  }
+
+
+}
+s8[[j]] = s7 %>% bind_rows()
+colnames(s8[[j]]) <- paste0(u_type[j],colnames(s8[[j]]))
+}
+#s9 = s8 %>% bind_cols(id = "game_id")
+```
+
+#Creating a complete dataset from list
+
+```{r}
+s9_a = merge(s8[[1]],s8[[2]],by.x = "cardgame_id",by.y = "card_ygame_id",all = TRUE)
+s9_b = merge(s9_a,s8[[3]],by.x = "cardgame_id",by.y = "cornergame_id",all = TRUE)
+s9_c = merge(s9_b,s8[[4]],by.x = "cardgame_id",by.y = "crossgame_id",all = TRUE)
+s9_d = merge(s9_c,s8[[5]],by.x = "cardgame_id",by.y = "foulcommitgame_id",all = TRUE)
+s9_e = merge(s9_d,s8[[6]],by.x = "cardgame_id",by.y = "goalgame_id",all = TRUE)
+s9_f = merge(s9_e,s8[[7]],by.x = "cardgame_id",by.y = "shotoffgame_id",all = TRUE)
+s9_g = merge(s9_f,s8[[8]],by.x = "cardgame_id",by.y = "shotongame_id",all = TRUE)
+s9 = merge(s9_g,s8[[9]],by.x = "cardgame_id",by.y = "throwingame_id",all = TRUE)
+```
+
+```{r}
+s9[is.na(s9)] <- 0
+s10 = s9
+```
+
+```{r}
+data_y1 = data_y %>% dplyr::select(id, home_team_api_id, away_team_api_id, home_team_goal, away_team_goal)
+colnames(data_y1) <- c("ID","Home Team ID","Away Team ID","Home_goals","Away_goals")
+```
+
+```{r}
+s11 = merge(s9,data_y1,by.x = "cardgame_id",by.y = "ID")
+
+s11$Outcome = ifelse(s11$Home_goals > s11$Away_goals,1,ifelse(s11$Home_goals == s11$Away_goals,0,-1))
+
+s12 = s11[,!(colnames(s11) %in% c("Home Team ID", "Away Team ID","Home_goals","Away_goals"))]
+```
+
+Adding overall variable to the dataset
+
+```{r}
+#Obtaining relevant variables
+
+data_y_subset = data_y[,c(1,6:9,56:77)]
+data_x_subset = data_x[,c(3:5)] 
+
+#For each game finding player in data_x and then adding appropriate overall after comparing the dates of the overall rating and game. Looping this over all 22 players in the game and then further over all 3040 matches.
+
+for(i in 1:3040){
+  for(j in 6:27){
+  
+data_x_subset1 = data_x_subset %>% filter(player_api_id == data_y_subset[i,j])
+
+if(length(data_x_subset1$date) > 0) {
+data_x_subset1$date_y = data_y_subset$date[i]
+data_x_subset2 = data_x_subset1[order(data_x_subset1$date),]
+data_x_subset2$indicator = ifelse(data_x_subset2$date >= data_x_subset2$date_y, 1,0)
+data_x_subset3 = data_x_subset2 %>% group_by(indicator) %>% filter(row_number() == n() & indicator == 0)
+data_y_subset[i,j+22] = data_x_subset3$overall_rating
+}
+
+if(length(data_x_subset1$date) == 0) {
+  data_y_subset[i,j+22] = 0
+  }
+
+colnames(data_y_subset)[j+22] = paste0(colnames(data_y_subset[j]),"_ovr")
+}
+}
+
+#Obtaining row and away overall means
+data_y_subset_final = data_y_subset
+data_y_subset_final[,28:49][data_y_subset_final[,28:49] == 0] <- NA
+data_y_subset_final$Home_overall_mean = rowMeans(data_y_subset[,c(28:38)],na.rm = TRUE)
+data_y_subset_final$Away_overall_mean = rowMeans(data_y_subset[,c(39:48)],na.rm = TRUE)
+
+overall_avg_data = data_y_subset_final[,c(1,50,51)]
+
+```
+
+```{r}
+#Merging avg data with main data wrt game ID
+s12_b = merge(s12,overall_avg_data,by.x = "cardgame_id",by.y = "id")
+```
+
+```{r}
+
+columns_to_remove <- grep("_id", names(s12_b))
+s13 = s12_b %>% dplyr::select(-columns_to_remove)
+```
+
+```{r}
+d = duplicated(s13) #Search for row duplicates
+d1 = duplicated(t(s13)) #Search for column duplicates
+d2 = s13[d]
+d3 = s13[d1]
+d4 = colnames(d3)
+
+s14_b = s13 %>% dplyr::select(-d4) #Data without duplicates with response variable
+```
+
+```{r}
+write.csv(s13,"Finaldata4c_complete.csv", row.names = TRUE)
+```
